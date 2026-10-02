@@ -171,7 +171,7 @@ export function buildRequestHeaders(
 const SYNC_INTERVAL = 5 * 60 * 1000 // 5 minutes
 const PROACTIVE_REFRESH_THRESHOLD_MS = 60 * 60 * 1000 // 1 hour before expiry
 
-const plugin: Plugin = async () => {
+const legacyPlugin: Plugin = async () => {
   initLogger()
 
   let accounts: ClaudeAccount[] = []
@@ -712,5 +712,206 @@ const plugin: Plugin = async () => {
   }
 }
 
-export const ClaudeAuthPlugin = plugin
-export default plugin
+type OpenCodeV2Context = {
+  integration?: {
+    transform?: (
+      callback: (editor: {
+        method: {
+          update(input: unknown): void
+        }
+      }) => void,
+    ) => Promise<unknown>
+  }
+}
+
+function toV2Credential(creds: ClaudeCredentials) {
+  return {
+    type: "oauth" as const,
+    methodID: "claude-code",
+    access: creds.accessToken,
+    refresh: creds.refreshToken,
+    expires: creds.expiresAt,
+  }
+}
+
+async function initializeV2ClaudeAuth() {
+  initLogger()
+
+  let accounts: ClaudeAccount[] = []
+  try {
+    accounts = readAllClaudeAccounts()
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err)
+    log("plugin_init_error", { error })
+    console.warn(
+      "opencode-claude-auth: Failed to read Claude Code credentials:",
+      error,
+    )
+    return { accounts, defaultAccountSource: null as string | null }
+  }
+
+  initAccounts(accounts)
+  const defaultAccountSource = accounts[0]?.source ?? null
+
+  if (accounts.length > 0) {
+    const persistedSource = loadPersistedAccountSource()
+    const defaultAccount =
+      (persistedSource && accounts.find((a) => a.source === persistedSource)) ||
+      accounts[0]
+
+    setActiveAccountSource(defaultAccount.source)
+
+    log("plugin_init", {
+      accountCount: accounts.length,
+      sources: accounts.map((a) => a.source),
+      activeSource: defaultAccount.source,
+      api: "v2",
+    })
+
+    const initialCreds = await getCachedCredentials()
+    if (initialCreds) {
+      syncAuthJson(initialCreds)
+    } else {
+      console.warn(
+        "opencode-claude-auth: Claude credentials are expired and could not be refreshed. Run `claude` to re-authenticate.",
+      )
+    }
+  } else {
+    log("plugin_init_no_accounts", {
+      reason: "no credentials found",
+      api: "v2",
+    })
+    console.warn(
+      "opencode-claude-auth: No Claude Code credentials found. Run `claude` to authenticate first.",
+    )
+  }
+
+  return { accounts, defaultAccountSource }
+}
+
+const v2Plugin = {
+  id: "opencode-claude-auth",
+  async setup(ctx: OpenCodeV2Context) {
+    const { accounts } = await initializeV2ClaudeAuth()
+
+    let proactiveRefreshWarned = false
+    const syncTimer = setInterval(async () => {
+      try {
+        const account = getActiveAccount()
+        log("proactive_refresh_check", {
+          source: account?.source ?? null,
+          expiresAt: account?.credentials?.expiresAt ?? null,
+          thresholdMs: PROACTIVE_REFRESH_THRESHOLD_MS,
+        })
+
+        const creds = await refreshIfNeeded(
+          undefined,
+          PROACTIVE_REFRESH_THRESHOLD_MS,
+        )
+        if (creds) {
+          syncAuthJson(creds)
+          if (proactiveRefreshWarned) {
+            log("proactive_refresh_recovered", { source: account?.source })
+          }
+          proactiveRefreshWarned = false
+        } else {
+          log("proactive_refresh_failed", { source: account?.source })
+          if (!proactiveRefreshWarned) {
+            proactiveRefreshWarned = true
+            console.warn(
+              "opencode-claude-auth: Proactive token refresh failed. Run `claude` to re-authenticate.",
+            )
+          }
+        }
+      } catch {
+        // Non-fatal background sync failure.
+      }
+    }, SYNC_INTERVAL)
+    syncTimer.unref()
+
+    await ctx.integration?.transform?.((editor) => {
+      editor.method.update({
+        integrationID: "anthropic",
+        method: {
+          id: "claude-code",
+          type: "oauth",
+          label:
+            accounts.length > 1
+              ? "Switch Claude Code account"
+              : "Use Claude Code credentials",
+          form:
+            accounts.length > 1
+              ? [
+                  {
+                    type: "string",
+                    key: "account",
+                    title: "Claude Code account source",
+                    description:
+                      "Leave blank to use the active Claude Code account.",
+                    required: false,
+                  },
+                ]
+              : undefined,
+        },
+        authorize: async (inputs: { account?: string } = {}) => {
+          const latestAccounts = refreshAccountsList()
+          const source =
+            inputs.account ||
+            loadPersistedAccountSource() ||
+            latestAccounts[0]?.source ||
+            accounts[0]?.source
+          const chosen =
+            latestAccounts.find((a) => a.source === source) ??
+            accounts.find((a) => a.source === source) ??
+            latestAccounts[0] ??
+            accounts[0]
+
+          if (!chosen) {
+            throw new Error(
+              "Claude Code credentials are unavailable. Run `claude` to authenticate first.",
+            )
+          }
+
+          setActiveAccountSource(chosen.source)
+          const creds = (await getCachedCredentials()) ?? chosen.credentials
+          syncAuthJson(creds)
+          saveAccountSource(chosen.source)
+
+          const sourceDescription =
+            chosen.source === "file"
+              ? `credentials file (${chosen.configDir ?? "~/.claude"}/.credentials.json)`
+              : `macOS Keychain (${chosen.source})`
+
+          return {
+            url: "",
+            instructions: `Using ${chosen.label} — credentials loaded from ${sourceDescription}.`,
+            mode: "auto" as const,
+            async callback() {
+              return toV2Credential(creds)
+            },
+          }
+        },
+        refresh: async () => {
+          const creds = await refreshIfNeeded(undefined, 60_000)
+          if (!creds) {
+            throw new Error(
+              "Claude Code credentials are unavailable or expired. Run `claude` to refresh them.",
+            )
+          }
+          syncAuthJson(creds)
+          return toV2Credential(creds)
+        },
+        label: () => "Claude Code",
+      })
+    })
+
+    return () => clearInterval(syncTimer)
+  },
+  async server(...args: Parameters<Plugin>) {
+    return legacyPlugin(...args)
+  },
+}
+
+export { legacyPlugin }
+export const ClaudeAuthPlugin = v2Plugin
+export default v2Plugin
