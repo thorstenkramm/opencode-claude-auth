@@ -722,6 +722,13 @@ type OpenCodeV2Context = {
       }) => void,
     ) => Promise<unknown>
   }
+  session?: {
+    hook?: (
+      name: string,
+      callback: (event: any) => void | Promise<void>,
+      options?: { providerID?: string },
+    ) => Promise<unknown>
+  }
 }
 
 function toV2Credential(creds: ClaudeCredentials) {
@@ -732,6 +739,28 @@ function toV2Credential(creds: ClaudeCredentials) {
     refresh: creds.refreshToken,
     expires: creds.expiresAt,
   }
+}
+
+async function loadFreshCredentials() {
+  return (await getCachedCredentials()) ?? (await getCredentialsWithBackoff({}))
+}
+
+function modelFromRequestBody(body: string | undefined) {
+  if (!body) return "unknown"
+  try {
+    return (JSON.parse(body) as { model?: string }).model ?? "unknown"
+  } catch {
+    return "unknown"
+  }
+}
+
+function hasSystemIdentity(
+  system: Array<string | { type?: string; text?: string }>,
+) {
+  return system.some((entry) => {
+    if (typeof entry === "string") return entry.includes(SYSTEM_IDENTITY)
+    return entry.text?.includes(SYSTEM_IDENTITY) ?? false
+  })
 }
 
 async function initializeV2ClaudeAuth() {
@@ -904,6 +933,65 @@ const v2Plugin = {
         label: () => "Claude Code",
       })
     })
+
+    await ctx.session?.hook?.(
+      "context",
+      (event) => {
+        if (event.model?.providerID !== "anthropic") return
+        if (!hasSystemIdentity(event.system)) {
+          event.system.unshift({ type: "text", text: SYSTEM_IDENTITY })
+        }
+      },
+      { providerID: "anthropic" },
+    )
+
+    await ctx.session?.hook?.(
+      "http.request",
+      async (event) => {
+        const request = event.request
+        const creds = await loadFreshCredentials()
+
+        if (!creds) {
+          if (getActiveRefreshFailureKind() === "transient") return
+          throw new Error(
+            "Claude Code credentials are unavailable or expired. Run `claude` to refresh them.",
+          )
+        }
+
+        const method = request.method
+        const body = ["GET", "HEAD"].includes(method)
+          ? undefined
+          : await request.clone().text()
+        const modelId = modelFromRequestBody(body)
+        const headers = buildRequestHeaders(
+          request,
+          { headers: request.headers, body },
+          creds.accessToken,
+          modelId,
+          getExcludedBetas(modelId),
+        )
+
+        event.request = new Request(buildRequestUrl(request), {
+          method,
+          headers,
+          body: body === undefined ? undefined : transformBody(body),
+          redirect: request.redirect,
+          signal: request.signal,
+        })
+      },
+      { providerID: "anthropic" },
+    )
+
+    await ctx.session?.hook?.(
+      "http.response",
+      (event) => {
+        event.response =
+          event.response.status === 401
+            ? event.response
+            : transformResponseStream(event.response)
+      },
+      { providerID: "anthropic" },
+    )
 
     return () => clearInterval(syncTimer)
   },
